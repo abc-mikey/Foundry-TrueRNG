@@ -277,9 +277,6 @@ Hooks.once("ready", () => {
         trueRandom.UpdateRandomNumbers();
 });
 Hooks.on("clientSettingChanged", (key, value) => {
-    console.log("TrueRandom setting changed:", key, value);
-});
-Hooks.on("clientSettingChanged", (key, value) => {
     if (key !== "core.diceConfiguration")
         return;
     if (trueRandom.IsInUse) {
