@@ -114,6 +114,9 @@ export class TrueRandom {
     public UpdateRandomNumbers(): void {
         if (!this.IsInUse || this.AwaitingResponse || !this.RandomGenerator) return;
 
+        // Don't fetch unless the cache is below its refill threshold.
+        if (this.RandomNumbers.length >= this.MaxCachedNumbers * this.UpdatePoint) return;
+
         // While the API is down the cache stays empty, so every single roll would otherwise fire
         // another request. Back off instead of hammering random.org once per die.
         if (Date.now() < this.NextRetryTime) return;
@@ -226,17 +229,16 @@ export class TrueRandom {
             return undefined;
         }
 
-        if (!this.RandomNumbers.length) {
-            this.UpdateRandomNumbers();
-            return undefined;
-        }
+        this.UpdateRandomNumbers();
 
-        if ((this.RandomNumbers.length / this.MaxCachedNumbers) < this.UpdatePoint) {
-            this.UpdateRandomNumbers();
+        if (!this.RandomNumbers.length) {
+            return undefined;
         }
 
         const randomNumber = this.PopRandomNumber();
         this.LastRandomNumber = randomNumber;
+
+        Debug.WriteLine(`Using cached random number: ${randomNumber} (${this.RandomNumbers.length} remaining)`);
 
         return randomNumber;
     }
@@ -322,5 +324,17 @@ Hooks.once('init', () => {
 
 Hooks.once("ready", () => {
     if (trueRandom.IsInUse) trueRandom.UpdateRandomNumbers();
+});
+
+Hooks.on("clientSettingChanged", (key, value) => {
+    console.log("TrueRandom setting changed:", key, value);
+});
+
+Hooks.on("clientSettingChanged", (key, value) => {
+    if (key !== "core.diceConfiguration") return;
+
+    if (trueRandom.IsInUse) {
+        trueRandom.UpdateRandomNumbers();
+    }
 });
 
