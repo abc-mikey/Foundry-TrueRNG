@@ -1,21 +1,15 @@
 import { Debug } from "./Debug.js";
 import { RandomAPI } from "./RandomAPI.js";
-import { Ref } from './Types.js';
 import { LocalStorage } from './BrowserConfig.js';
 export class TrueRandom {
     constructor() {
         this.RandomNumbers = [];
         this.RandomGenerator = null;
-        this.OriginalRandomFunction = Math.random;
-        this.PreRNGEventHandler = null;
-        this.PostRNGEventHandler = null;
         this.AwaitingResponse = false;
         this.MaxCachedNumbers = 50;
         this.UpdatePoint = 0.5;
         this.HasAlerted = false;
-        this.Enabled = true;
         this.LastRandomNumber = Math.random();
-        this.QuickToggleButton = null;
         this.ApiFailureCount = 0;
         this.HasNotifiedApiFailure = false;
         this.HasNotifiedLowQuota = false;
@@ -37,6 +31,19 @@ export class TrueRandom {
     /** True when this client is a logged-in GM, who is the only one who can act on an API problem. */
     get IsGM() {
         return !!game?.user?.isGM;
+    }
+    /** True when this client has picked TrueRandom as the source for at least one die. */
+    // TODO this could probably be private
+    get IsInUse() {
+        try {
+            const config = game.settings.get("core", "diceConfiguration");
+            if (!config)
+                return false;
+            return Object.values(config).some(method => method === "truerandom");
+        }
+        catch (error) {
+            return false;
+        }
     }
     /**
      * Surface a message to the user, and report whether it was actually shown.
@@ -73,84 +80,8 @@ export class TrueRandom {
             return `error ${reason.code}`;
         return String(reason);
     }
-    /** Inject the button's stylesheet once per page, no matter how often we re-attach. */
-    EnsureQuickToggleStyle() {
-        if (document.getElementById("TrueRandomQuickToggleStyle"))
-            return;
-        const style = document.createElement("style");
-        style.id = "TrueRandomQuickToggleStyle";
-        style.innerHTML = `
-            .trhidden { display: none; }
-            .trvisible { display: initial; }
-            .trquickbutton {
-                flex: inherit;
-                margin: auto auto;
-                text-align: center;
-                padding-right: 4px;
-            }`;
-        document.head.appendChild(style);
-    }
-    /** Bring the button's label and visibility back in line with the current settings. */
-    RefreshQuickToggleButton() {
-        const button = this.QuickToggleButton;
-        if (!button)
-            return;
-        let visible = true;
-        let enabled = true;
-        try {
-            visible = game.settings.get("truerandom", "QUICKTOGGLE");
-            enabled = game.settings.get("truerandom", "ENABLED");
-        }
-        catch (error) { /* settings not registered yet; fall back to the defaults above */ }
-        button.innerHTML = enabled ? "RndON" : "RndOFF";
-        button.classList.toggle("trvisible", !!visible);
-        button.classList.toggle("trhidden", !visible);
-    }
-    /**
-     * Create the GM's quick-toggle button and put it in the chat controls.
-     *
-     * Safe to call repeatedly: from v13 onward Foundry renders the chat input and #chat-controls
-     * outside the normal ChatLog render cycle and re-parents them as the sidebar is collapsed,
-     * popped out, or switched to notification mode (see the renderChatInput hook). A button
-     * attached on the first render can therefore end up detached, so every call re-homes the
-     * existing button rather than bailing out because one was already made.
-     */
-    GenerateQuickToggleButton(visible) {
-        if (!this.IsGM)
-            return;
-        const container = document.querySelector("#chat-controls");
-        if (!container)
-            return;
-        // already sitting in the live controls: nothing to move, just resync the label.
-        if (this.QuickToggleButton?.isConnected && this.QuickToggleButton.parentElement === container) {
-            this.RefreshQuickToggleButton();
-            return;
-        }
-        this.EnsureQuickToggleStyle();
-        // reuse the existing element when we have one — insertBefore MOVES a node, so the click
-        // listener survives and we never stack a second handler on the same button.
-        let button = this.QuickToggleButton;
-        if (!button) {
-            button = document.createElement("a");
-            button.id = "TrueRandomQuickToggleButton";
-            button.title = "Toggle the TrueRandom module";
-            button.classList.add("trquickbutton");
-            button.addEventListener("click", () => {
-                const isEnabled = game.settings.get("truerandom", "ENABLED");
-                // the ENABLED onChange handler repaints the label, so don't set it here as well.
-                game.settings.set("truerandom", "ENABLED", !isEnabled);
-            });
-        }
-        container.insertBefore(button, container.firstElementChild);
-        this.QuickToggleButton = button;
-        if (visible != undefined) {
-            button.classList.toggle("trvisible", visible);
-            button.classList.toggle("trhidden", !visible);
-        }
-        this.RefreshQuickToggleButton();
-    }
     UpdateRandomNumbers() {
-        if (!this.Enabled || this.AwaitingResponse || !this.RandomGenerator)
+        if (!this.IsInUse || this.AwaitingResponse || !this.RandomGenerator)
             return;
         // While the API is down the cache stays empty, so every single roll would otherwise fire
         // another request. Back off instead of hammering random.org once per die.
@@ -240,9 +171,9 @@ export class TrueRandom {
         this.PendingApiFailureNotice = !shown;
     }
     GetRandomNumber() {
-        // deliberately switched off: fall back silently, this is not a problem to report.
-        if (!this.Enabled) {
-            return this.OriginalRandomFunction();
+        // not selected by this user: tell core to use its default source instead.
+        if (!this.IsInUse) {
+            return undefined;
         }
         if (!this.RandomGenerator?.ApiKey) {
             // Only the GM can set the world-scoped key, so only the GM is told about it. Both
@@ -252,26 +183,18 @@ export class TrueRandom {
             if (!this.HasAlerted && this.IsGM) {
                 this.HasAlerted = this.Notify("warn", "No random.org API key is set, so dice rolls are using Foundry's built-in randomness. Add a key in Module Settings to enable true randomness.");
             }
-            return this.OriginalRandomFunction();
+            return undefined;
         }
         if (!this.RandomNumbers.length) {
             this.UpdateRandomNumbers();
-            return this.OriginalRandomFunction();
-        }
-        let rngFuncReference = new Ref(this.PopRandomNumber.bind(this));
-        if (this.PreRNGEventHandler && this.PreRNGEventHandler(this, rngFuncReference)) {
-            rngFuncReference.Reference = this.OriginalRandomFunction;
+            return undefined;
         }
         if ((this.RandomNumbers.length / this.MaxCachedNumbers) < this.UpdatePoint) {
             this.UpdateRandomNumbers();
         }
-        let randomNumber = rngFuncReference.Reference();
-        let randomNumberRef = new Ref(randomNumber);
-        if (this.PostRNGEventHandler) {
-            this.PostRNGEventHandler(this, randomNumberRef);
-        }
-        this.LastRandomNumber = randomNumberRef.Reference;
-        return this.LastRandomNumber;
+        const randomNumber = this.PopRandomNumber();
+        this.LastRandomNumber = randomNumber;
+        return randomNumber;
     }
     PopRandomNumber() {
         const ms = new Date().getTime();
@@ -290,8 +213,16 @@ TrueRandom.MaxRetryDelayMs = 300000;
 var trueRandom = new TrueRandom();
 globalThis.TrueRandom = trueRandom;
 Hooks.once('init', () => {
-    trueRandom.OriginalRandomFunction = CONFIG.Dice.randomUniform ?? Math.random;
-    CONFIG.Dice.randomUniform = trueRandom.GetRandomNumber.bind(trueRandom);
+    CONFIG.Dice.fulfillment.methods.truerandom = {
+        label: "TrueRandom (random.org)",
+        icon: "fas fa-dice-d20",
+        handler: async (term) => {
+            const rng = trueRandom.GetRandomNumber();
+            return rng == undefined
+                ? undefined
+                : 1 + Math.floor(rng * (term.faces ?? 100));
+        }
+    };
     game.settings.register("truerandom", "APIKEY", {
         name: "Random.org API Key",
         hint: "Put your developer key from https://api.random.org/dashboard here",
@@ -321,25 +252,6 @@ Hooks.once('init', () => {
         default: true,
         onChange: value => Debug.WriteLine(`Debug: ${value}`)
     });
-    game.settings.register("truerandom", "ENABLED", {
-        name: "Enabled",
-        hint: "Enables/Disables the module",
-        scope: "world", config: true, type: Boolean,
-        default: true,
-        onChange: value => {
-            trueRandom.Enabled = value;
-            // keep the quick toggle's label honest when ENABLED is changed from the settings
-            // dialog, or by another client, rather than by clicking the button itself.
-            trueRandom.RefreshQuickToggleButton();
-        }
-    });
-    game.settings.register("truerandom", "QUICKTOGGLE", {
-        name: "Show Quick Toggle Button",
-        hint: "Toggle ON/OFF above chat",
-        scope: "client", config: true, type: Boolean,
-        default: true,
-        onChange: () => trueRandom.RefreshQuickToggleButton()
-    });
     game.settings.register("truerandom", "SHOWSEEDS", {
         name: "Show Seeds in Chat",
         hint: "Display fetched random seeds in chat when retrieved from random.org",
@@ -358,19 +270,8 @@ Hooks.once('init', () => {
         game.settings.set("truerandom", "APIKEY", savedKey);
         trueRandom.UpdateAPIKey(savedKey);
     }
-    trueRandom.Enabled = game.settings.get("truerandom", "ENABLED");
 });
-const attachQuickToggleButton = () => {
-    let visible = true;
-    try {
-        visible = game.settings.get("truerandom", "QUICKTOGGLE");
-    }
-    catch (e) { }
-    trueRandom.GenerateQuickToggleButton(visible);
-};
-// Foundry v13+ moves the chat input and #chat-controls around outside the ChatLog render cycle,
-// so listen for every event that can leave our button orphaned instead of attaching once.
-// GenerateQuickToggleButton is idempotent, so the overlapping hooks are harmless.
-Hooks.on("renderChatLog", attachQuickToggleButton);
-Hooks.on("renderChatInput", attachQuickToggleButton);
-Hooks.once("ready", attachQuickToggleButton);
+Hooks.once("ready", () => {
+    if (trueRandom.IsInUse)
+        trueRandom.UpdateRandomNumbers();
+});
